@@ -1,0 +1,80 @@
+#!/usr/bin/python3
+from datetime import datetime
+from decimal import Decimal
+import serial
+import struct
+import textwrap
+import time
+import mysql.connector
+import requests
+import json
+
+cnx = mysql.connector.connect(user=MYSQL_USER, password=MYSQL_PASS,
+                              host=MYSQL_HOST, database=MYSQL_DB)
+cursor = cnx.cursor()
+ADD_READING = ("INSERT INTO readings "
+               "(abscint, mbasement) "
+               "VALUES (%s, %s)")
+
+# Fetch wrap counters
+abscintWrap = 0
+mbasementWrap = 0
+abscintLast = 0
+mbasementLast = 0
+
+query = ("SELECT abscint, mbasement FROM readings ORDER BY timestamp DESC LIMIT 1")
+cursor.execute(query)
+
+for (abscint, mbasement) in cursor:
+    abscint = int(abscint * 10)
+    mbasement = int(mbasement * 10)
+
+    abscintWrap = abscint // (2**16)
+    mbasementWrap = mbasement // (2**16)
+    abscintLast = abscint % (2**16)
+    mbasementLast = mbasement % (2**16)
+
+session = requests.Session()
+
+# Read from serial
+with serial.Serial("/dev/ttyAMA0", 19200) as ser:
+    while True:
+        rx = ser.readline()
+        # Valid datagram?
+        if rx[:9] != b'AT+SCASTB':
+            continue
+
+        # Decrypt bytes
+        abscint = struct.unpack('<H', rx[15:17])[0]
+        mbasement = struct.unpack('<H', rx[17:19])[0]
+
+        requests.post("https://www.sbz.utwente.nl/flow/api/1/update", data={
+            'secret': UPDATE_SECRET,
+            'data': json.dumps([
+                {'index': 0, 'value': abscint},
+                {'index': 1, 'value': mbasement},
+            ]),
+        })
+
+
+        # Wrap around? (allow 10 difference due to percision issues)
+        if abscint < (abscintLast - 10):
+            abscintWrap = abscintWrap + 1
+        abscintLast = abscint
+
+        if mbasement < (mbasementLast - 10):
+            mbasementWrap = mbasementWrap + 1
+        mbasementLast = mbasement
+
+        # Add offsets
+        abscint = (abscintWrap * (2**16)) + abscint
+        abscint = Decimal(abscint) / 10
+        mbasement = (mbasementWrap * (2**16)) + mbasement
+        mbasement = Decimal(mbasement) / 10
+
+        # Commit to DB
+        cursor.execute(ADD_READING, (abscint, mbasement))
+        cnx.commit()
+
+cursor.close()
+cnx.close()
